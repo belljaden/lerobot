@@ -8,9 +8,18 @@ Usage:
     dataset = PatchedLeRobotDataset(
         repo_id="lerobot/aloha_sim_insertion_human_image",
         episodes=[0],
+        download_videos=False,  # skip downloading video files entirely
     )
     item = dataset[0]
     # item["observation.images.top"] will be a zero tensor with the correct shape
+
+    # Works with DataLoader as expected:
+    from torch.utils.data import DataLoader
+    loader = DataLoader(dataset, batch_size=32, num_workers=4)
+    for batch in loader:
+        # batch["observation.images.top"] → fake zero frames (fast)
+        # batch["observation.state"], batch["action"], etc. → real data
+        pass
 """
 
 import torch
@@ -19,13 +28,17 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 class PatchedLeRobotDataset(LeRobotDataset):
-    """LeRobotDataset that returns fake video frames instead of decoding actual videos.
+    """LeRobotDataset that skips video decoding and returns fake frames.
 
-    This is useful when you want to work with the non-video data (states, actions, etc.)
-    without needing actual video files or paying the cost of video decoding.
+    __getitem__ flow:
+      1. hf_dataset[idx]          → parquet read (state/action, fast)
+      2. _query_hf_dataset()      → already skips video_keys (fast)
+      3. _get_query_timestamps()  → lightweight timestamp lookup (fast)
+      4. _query_videos()          → THIS is the bottleneck (decode_video_frames)
+                                    we override this to return zero tensors
 
-    Fake frames are zero-valued tensors shaped according to the feature metadata,
-    e.g. shape (channels, height, width) as defined in info.json.
+    By also passing download_videos=False to __init__, you skip downloading
+    the mp4 files entirely.
     """
 
     def _query_videos(
@@ -38,10 +51,10 @@ class PatchedLeRobotDataset(LeRobotDataset):
             num_frames = len(query_ts)
 
             if num_frames == 1:
-                # Single frame query → return shape (C, H, W) to match squeeze(0) behavior
+                # Single frame → (C, H, W), matching original squeeze(0) behavior
                 item[vid_key] = torch.zeros(shape, dtype=torch.float32)
             else:
-                # Multi-frame query → return shape (num_frames, C, H, W)
+                # Multi-frame → (num_frames, C, H, W)
                 item[vid_key] = torch.zeros((num_frames, *shape), dtype=torch.float32)
 
         return item
