@@ -1,6 +1,6 @@
 """
-PatchedLeRobotDataset: LeRobotDataset subclass that selectively skips
-video decoding based on keyword matching.
+PatchedLeRobotDataset: LeRobotDataset subclass that completely excludes
+certain video keys from loading based on keyword matching.
 
 Usage:
     from patched_lerobot_dataset import PatchedLeRobotDataset
@@ -11,8 +11,8 @@ Usage:
         skip_video_keywords=["wrist", "side"],
     )
 
-    # "observation.images.wrist"      → zero tensor (skipped)
-    # "observation.images.left_wrist" → zero tensor (skipped)
+    # "observation.images.wrist"      → not in item at all (no memory usage)
+    # "observation.images.left_wrist" → not in item at all
     # "observation.images.top"        → real decoded frame
 """
 
@@ -29,18 +29,18 @@ class PatchedLeRobotDataset(LeRobotDataset):
     def _should_skip(self, vid_key: str) -> bool:
         return any(kw in vid_key for kw in self._skip_video_keywords)
 
-    def _query_videos(self, query_timestamps, ep_idx):
-        skipped = {}
-        kept = {}
-        for vid_key, ts in query_timestamps.items():
-            if self._should_skip(vid_key):
-                shape = tuple(self.meta.features[vid_key]["shape"])
-                n = len(ts)
-                skipped[vid_key] = torch.zeros(shape if n == 1 else (n, *shape), dtype=torch.float32)
-            else:
-                kept[vid_key] = ts
+    def _get_query_timestamps(self, current_ts, query_indices=None):
+        # Get all timestamps, then drop skipped keys
+        query_timestamps = super()._get_query_timestamps(current_ts, query_indices)
+        return {k: v for k, v in query_timestamps.items() if not self._should_skip(k)}
 
-        item = skipped
-        if kept:
-            item.update(super()._query_videos(kept, ep_idx))
-        return item
+    def _query_videos(self, query_timestamps, ep_idx):
+        # query_timestamps already has skipped keys removed by _get_query_timestamps
+        if not query_timestamps:
+            return {}
+        return super()._query_videos(query_timestamps, ep_idx)
+
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        # Remove skipped keys from the final item
+        return {k: v for k, v in item.items() if not self._should_skip(k)}
