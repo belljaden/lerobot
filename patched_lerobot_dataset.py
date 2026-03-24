@@ -1,60 +1,56 @@
 """
-PatchedLeRobotDataset: LeRobotDataset subclass that skips video decoding
-and returns fake (zero) frames matching the expected video shape.
+Monkey-patch to selectively skip video decoding in LeRobotDataset.
 
 Usage:
-    from patched_lerobot_dataset import PatchedLeRobotDataset
+    import patched_lerobot_dataset  # just import to apply patch
 
-    dataset = PatchedLeRobotDataset(
-        repo_id="lerobot/aloha_sim_insertion_human_image",
-        episodes=[0],
-        download_videos=False,  # skip downloading video files entirely
-    )
-    item = dataset[0]
-    # item["observation.images.top"] will be a zero tensor with the correct shape
+    # Then use LeRobotDataset as normal — matched video keys will return zero tensors
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    dataset = LeRobotDataset(repo_id="...", episodes=[0])
 
-    # Works with DataLoader as expected:
-    from torch.utils.data import DataLoader
-    loader = DataLoader(dataset, batch_size=32, num_workers=4)
-    for batch in loader:
-        # batch["observation.images.top"] → fake zero frames (fast)
-        # batch["observation.state"], batch["action"], etc. → real data
-        pass
+Customize SKIP_VIDEO_KEYWORDS to control which video keys are skipped.
+A vid_key is skipped if it contains ANY of the keywords (substring match).
+
+Examples:
+    SKIP_VIDEO_KEYWORDS = ["wrist"]
+      → skips "observation.images.wrist", "observation.images.left_wrist", etc.
+
+    SKIP_VIDEO_KEYWORDS = ["wrist", "side"]
+      → skips any vid_key containing "wrist" OR "side"
+
+    SKIP_VIDEO_KEYWORDS = []
+      → skip nothing (no-op)
 """
 
 import torch
+import lerobot.datasets.lerobot_dataset as _ld_module
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+# ===== Configure here =====
+SKIP_VIDEO_KEYWORDS = ["wrist", "side"]
+# ===========================
+
+_original_query_videos = _ld_module.LeRobotDataset._query_videos
 
 
-class PatchedLeRobotDataset(LeRobotDataset):
-    """LeRobotDataset that skips video decoding and returns fake frames.
+def _should_skip(vid_key: str) -> bool:
+    return any(kw in vid_key for kw in SKIP_VIDEO_KEYWORDS)
 
-    __getitem__ flow:
-      1. hf_dataset[idx]          → parquet read (state/action, fast)
-      2. _query_hf_dataset()      → already skips video_keys (fast)
-      3. _get_query_timestamps()  → lightweight timestamp lookup (fast)
-      4. _query_videos()          → THIS is the bottleneck (decode_video_frames)
-                                    we override this to return zero tensors
 
-    By also passing download_videos=False to __init__, you skip downloading
-    the mp4 files entirely.
-    """
-
-    def _query_videos(
-        self, query_timestamps: dict[str, list[float]], ep_idx: int
-    ) -> dict[str, torch.Tensor]:
-        item = {}
-        for vid_key, query_ts in query_timestamps.items():
-            # shape from metadata: (channels, height, width)
+def _patched_query_videos(self, query_timestamps, ep_idx):
+    skipped = {}
+    kept = {}
+    for vid_key, ts in query_timestamps.items():
+        if _should_skip(vid_key):
             shape = tuple(self.meta.features[vid_key]["shape"])
-            num_frames = len(query_ts)
+            n = len(ts)
+            skipped[vid_key] = torch.zeros(shape if n == 1 else (n, *shape), dtype=torch.float32)
+        else:
+            kept[vid_key] = ts
 
-            if num_frames == 1:
-                # Single frame → (C, H, W), matching original squeeze(0) behavior
-                item[vid_key] = torch.zeros(shape, dtype=torch.float32)
-            else:
-                # Multi-frame → (num_frames, C, H, W)
-                item[vid_key] = torch.zeros((num_frames, *shape), dtype=torch.float32)
+    item = skipped
+    if kept:
+        item.update(_original_query_videos(self, kept, ep_idx))
+    return item
 
-        return item
+
+_ld_module.LeRobotDataset._query_videos = _patched_query_videos
